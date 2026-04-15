@@ -2,10 +2,12 @@ package switcher
 
 import (
 	"fmt"
-	"os"
+	"net/url"
+	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
+
+	"gopkg.in/ini.v1"
 )
 
 type RepoType string
@@ -18,7 +20,9 @@ const (
 )
 
 type Config struct {
-	RepoDir string
+	RepoDir         string
+	MirrorHost      string
+	DisableOpenH264 bool
 }
 
 func Switch(repoType RepoType, config Config) ([]string, error) {
@@ -43,7 +47,11 @@ func Switch(repoType RepoType, config Config) ([]string, error) {
 
 	var switched []string
 	for _, file := range files {
-		if err := switchFile(file, repoType); err != nil {
+		if repoType == Fedora && isFedoraOpenH264RepoFile(file) && !config.DisableOpenH264 {
+			continue
+		}
+
+		if err := switchFile(file, repoType, config); err != nil {
 			return switched, fmt.Errorf("failed to switch %s: %w", file, err)
 		}
 		switched = append(switched, file)
@@ -52,66 +60,211 @@ func Switch(repoType RepoType, config Config) ([]string, error) {
 	return switched, nil
 }
 
-func switchFile(filePath string, repoType RepoType) error {
-	content, err := os.ReadFile(filePath)
+func switchFile(filePath string, repoType RepoType, config Config) error {
+	cfg, err := ini.LoadSources(ini.LoadOptions{
+		SkipUnrecognizableLines:    true,
+		AllowShadows:               true,
+		AllowPythonMultilineValues: true,
+	}, filePath)
 	if err != nil {
 		return err
 	}
 
-	lines := strings.Split(string(content), "\n")
-	var result []string
+	isOpenH264Repo := repoType == Fedora && isFedoraOpenH264RepoFile(filePath)
 
-	for _, line := range lines {
-		newLine := applyReplacements(line, repoType)
-		result = append(result, newLine)
+	for _, section := range cfg.Sections() {
+		if section.Name() == ini.DefaultSection {
+			continue
+		}
+
+		if isOpenH264Repo {
+			if config.DisableOpenH264 {
+				section.Key("enabled").SetValue("0")
+			}
+			continue
+		}
+
+		if repoType == Fedora && updateFedoraBaseURL(section, config.MirrorHost) {
+			continue
+		}
+
+		// Disable mirrorlist/metalink
+		disableKey(section, "mirrorlist")
+		disableKey(section, "metalink")
+
+		// Try to find baseurl, or even a commented out one
+		var baseURL string
+		if section.HasKey("baseurl") {
+			baseURL = section.Key("baseurl").Value()
+		} else if section.HasKey("#baseurl") {
+			baseURL = section.Key("#baseurl").Value()
+			section.DeleteKey("#baseurl")
+		}
+
+		if baseURL != "" {
+			newURL := normalizeURL(baseURL, config.MirrorHost, repoType)
+			section.Key("baseurl").SetValue(newURL)
+		}
 	}
 
-	return os.WriteFile(filePath, []byte(strings.Join(result, "\n")), 0644)
+	return cfg.SaveTo(filePath)
 }
 
-func applyReplacements(line string, repoType RepoType) string {
-	line = strings.TrimRight(line, "\r")
+func disableKey(section *ini.Section, keyName string) {
+	if !section.HasKey(keyName) {
+		return
+	}
 
-	// 1. Comment out mirrorlist/metalink
-	if strings.HasPrefix(strings.TrimSpace(line), "mirrorlist=") || strings.HasPrefix(strings.TrimSpace(line), "metalink=") {
-		if !strings.HasPrefix(strings.TrimSpace(line), "#") {
-			return "#" + line
+	key := section.Key(keyName)
+	commentedKeyName := "#" + keyName
+	if !section.HasKey(commentedKeyName) {
+		_, _ = section.NewKey(commentedKeyName, key.Value())
+	}
+	section.DeleteKey(keyName)
+}
+
+func isFedoraOpenH264RepoFile(filePath string) bool {
+	return strings.HasPrefix(filepath.Base(filePath), "fedora-cisco-openh264")
+}
+
+func updateFedoraBaseURL(section *ini.Section, mirrorHost string) bool {
+	repoID := fedoraRepoID(section)
+	subPath, ok := fedoraRepoSubPath(repoID)
+	if !ok {
+		subPath, ok = fedoraSectionSubPath(section.Name())
+	}
+	if !ok {
+		return false
+	}
+
+	disableKey(section, "mirrorlist")
+	disableKey(section, "metalink")
+	if section.HasKey("#baseurl") {
+		section.DeleteKey("#baseurl")
+	}
+
+	baseURL := (&url.URL{
+		Scheme: "https",
+		Host:   mirrorHost,
+		Path:   path.Join("/fedora", subPath),
+	}).String()
+	section.Key("baseurl").SetValue(baseURL)
+	return true
+}
+
+func fedoraRepoID(section *ini.Section) string {
+	for _, keyName := range []string{"metalink", "#metalink"} {
+		if !section.HasKey(keyName) {
+			continue
+		}
+
+		value := section.Key(keyName).Value()
+		parsed, err := url.Parse(value)
+		if err != nil {
+			continue
+		}
+
+		repoID := parsed.Query().Get("repo")
+		if repoID != "" {
+			return repoID
 		}
 	}
 
-	// 2. Enable and replace baseurl
-	switch repoType {
-	case Rocky:
-		re := regexp.MustCompile(`^#?baseurl=http://dl.rockylinux.org/\$contentdir`)
-		if re.MatchString(line) {
-			return "baseurl=https://mirrors.cernet.edu.cn/rocky"
-		}
-	case EPEL:
-		re := regexp.MustCompile(`^#?baseurl=http://download.fedoraproject.org/pub/epel/`)
-		if re.MatchString(line) {
-			return "baseurl=https://mirrors.cernet.edu.cn/epel/"
-		}
-	case Fedora:
-		re := regexp.MustCompile(`^#?baseurl=http://download.example/pub/fedora/linux`)
-		if re.MatchString(line) {
-			return "baseurl=https://mirrors.cernet.edu.cn/fedora"
-		}
-		// Some fedora repos use a different baseurl pattern or might already have a commented out one
-		if strings.Contains(line, "download.fedoraproject.org/pub/fedora/linux") {
-			line = strings.Replace(line, "https://mirrors.fedoraproject.org/metalink?repo=fedora-$releasever&arch=$basearch", "https://mirrors.cernet.edu.cn/fedora/releases/$releasever/Everything/$basearch/os/", 1)
-			line = strings.Replace(line, "https://mirrors.fedoraproject.org/metalink?repo=updates-released-f$releasever&arch=$basearch", "https://mirrors.cernet.edu.cn/fedora/updates/$releasever/Everything/$basearch/", 1)
-		}
+	return ""
+}
 
-	case RPMFusion:
-		if strings.Contains(line, "download.viva-mp.com/pub/rpmfusion/") {
-			line = strings.Replace(line, "http://download.viva-mp.com/pub/rpmfusion/", "https://mirrors.cernet.edu.cn/rpmfusion/", 1)
-			line = strings.TrimPrefix(line, "#")
-		}
-		if strings.Contains(line, "download.rpmfusion.org/") {
-			line = strings.Replace(line, "http://download.rpmfusion.org/", "https://mirrors.cernet.edu.cn/rpmfusion/", 1)
-			line = strings.TrimPrefix(line, "#")
-		}
+func fedoraRepoSubPath(repoID string) (string, bool) {
+	switch repoID {
+	case "fedora-$releasever":
+		return "releases/$releasever/Everything/$basearch/os", true
+	case "fedora-debug-$releasever":
+		return "releases/$releasever/Everything/$basearch/debug/tree", true
+	case "fedora-source-$releasever":
+		return "releases/$releasever/Everything/source/tree", true
+	case "updates-released-f$releasever":
+		return "updates/$releasever/Everything/$basearch", true
+	case "updates-released-debug-f$releasever":
+		return "updates/$releasever/Everything/$basearch/debug", true
+	case "updates-released-source-f$releasever":
+		return "updates/$releasever/Everything/source/tree", true
+	case "updates-testing-f$releasever":
+		return "updates/testing/$releasever/Everything/$basearch", true
+	case "updates-testing-debug-f$releasever":
+		return "updates/testing/$releasever/Everything/$basearch/debug", true
+	case "updates-testing-source-f$releasever":
+		return "updates/testing/$releasever/Everything/source/tree", true
+	case "rawhide":
+		return "development/rawhide/Everything/$basearch/os", true
+	case "rawhide-debug":
+		return "development/rawhide/Everything/$basearch/debug/tree", true
+	case "rawhide-source":
+		return "development/rawhide/Everything/source/tree", true
+	default:
+		return "", false
+	}
+}
+
+func fedoraSectionSubPath(sectionName string) (string, bool) {
+	switch sectionName {
+	case "fedora":
+		return "releases/$releasever/Everything/$basearch/os", true
+	case "fedora-debuginfo":
+		return "releases/$releasever/Everything/$basearch/debug/tree", true
+	case "fedora-source":
+		return "releases/$releasever/Everything/source/tree", true
+	case "updates":
+		return "updates/$releasever/Everything/$basearch", true
+	case "updates-debuginfo":
+		return "updates/$releasever/Everything/$basearch/debug", true
+	case "updates-source":
+		return "updates/$releasever/Everything/source/tree", true
+	case "updates-testing":
+		return "updates/testing/$releasever/Everything/$basearch", true
+	case "updates-testing-debuginfo":
+		return "updates/testing/$releasever/Everything/$basearch/debug", true
+	case "updates-testing-source":
+		return "updates/testing/$releasever/Everything/source/tree", true
+	case "rawhide":
+		return "development/rawhide/Everything/$basearch/os", true
+	case "rawhide-debuginfo":
+		return "development/rawhide/Everything/$basearch/debug/tree", true
+	case "rawhide-source":
+		return "development/rawhide/Everything/source/tree", true
+	default:
+		return "", false
+	}
+}
+
+func normalizeURL(originalURL string, mirrorHost string, repoType RepoType) string {
+	u, err := url.Parse(originalURL)
+	if err != nil || u.Host == "" {
+		return originalURL
 	}
 
-	return line
+	u.Scheme = "https"
+	u.Host = mirrorHost
+
+	path := u.Path
+	// Strip known public prefixes and redundant segments
+	path = strings.TrimPrefix(path, "/pub/rocky")
+	path = strings.TrimPrefix(path, "/pub/epel")
+	path = strings.TrimPrefix(path, "/pub/fedora/linux")
+	path = strings.TrimPrefix(path, "/pub/rpmfusion")
+	path = strings.TrimPrefix(path, "/$contentdir")
+
+	// Special case: if it already starts with the repo name but has 'linux' in it, strip it
+	// e.g., /fedora/linux/releases/... -> /fedora/releases/...
+	if strings.HasPrefix(path, "/fedora/linux/") {
+		path = "/fedora/" + strings.TrimPrefix(path, "/fedora/linux/")
+	}
+
+	// Ensure the path starts with the repo name
+	repoPrefix := "/" + string(repoType)
+	if !strings.HasPrefix(path, repoPrefix) {
+		path = repoPrefix + "/" + strings.TrimPrefix(path, "/")
+	}
+
+	// Clean up any double slashes
+	u.Path = strings.ReplaceAll(path, "//", "/")
+	return u.String()
 }

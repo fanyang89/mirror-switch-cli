@@ -5,6 +5,7 @@ go 1.26.2
 require (
 	github.com/AlecAivazis/survey/v2 v2.3.7
 	github.com/spf13/cobra v1.10.2
+	gopkg.in/ini.v1 v1.67.1
 )
 
 require (

@@ -3,10 +3,11 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/fanyang89/mirror-switch-cli/pkg/backup"
+	"github.com/fanyang89/mirror-switch-cli/pkg/mirrors"
 	"github.com/fanyang89/mirror-switch-cli/pkg/osdetect"
 	"github.com/fanyang89/mirror-switch-cli/pkg/switcher"
 
@@ -15,11 +16,11 @@ import (
 )
 
 var (
-	repoDir       string
-	osReleasePath string
-	noCache       bool
-	dryRun        bool
-	interactive   bool
+	repoDir         string
+	osReleasePath   string
+	dryRun          bool
+	interactive     bool
+	disableOpenH264 bool
 )
 
 var rootCmd = &cobra.Command{
@@ -72,13 +73,64 @@ var switchCmd = &cobra.Command{
 			selectedRepoTypes = availableRepoTypes
 		}
 
+		mirrorOptions := []string{}
+		for _, m := range mirrors.MirrorNodes {
+			mirrorOptions = append(mirrorOptions, fmt.Sprintf("%s [%s]", m.Name, m.Host))
+		}
+
 		for _, rt := range selectedRepoTypes {
-			fmt.Printf("Processing %s repositories...\n", rt)
+			fmt.Printf("\nProcessing %s repositories...\n", rt)
 			files, _ := filepath.Glob(filepath.Join(repoDir, fmt.Sprintf("%s*.repo", rt)))
 			if len(files) == 0 {
 				fmt.Printf("  No %s repo files found, skipping.\n", rt)
 				continue
 			}
+
+			disableOpenH264ForRepo := disableOpenH264
+			if interactive && rt == switcher.Fedora {
+				openH264Files, _ := filepath.Glob(filepath.Join(repoDir, "fedora-cisco-openh264*.repo"))
+				if len(openH264Files) > 0 {
+					defaultAction := "Skip"
+					if disableOpenH264ForRepo {
+						defaultAction = "Disable"
+					}
+
+					var openH264Action string
+					prompt := &survey.Select{
+						Message: "fedora-cisco-openh264 repositories detected:",
+						Options: []string{"Skip", "Disable"},
+						Default: defaultAction,
+					}
+					if err := survey.AskOne(prompt, &openH264Action); err != nil {
+						fmt.Printf("  Prompt failed: %v\n", err)
+						continue
+					}
+
+					disableOpenH264ForRepo = openH264Action == "Disable"
+					fmt.Printf("  fedora-cisco-openh264: %s\n", strings.ToLower(openH264Action))
+				}
+			}
+
+			selectedMirrorHost := "mirrors.cernet.edu.cn"
+			if interactive {
+				var mirrorSelection string
+				prompt := &survey.Select{
+					Message: fmt.Sprintf("Select a mirror site for %s:", rt),
+					Options: mirrorOptions,
+					Default: mirrorOptions[0],
+				}
+				if err := survey.AskOne(prompt, &mirrorSelection); err != nil {
+					fmt.Printf("  Prompt failed: %v\n", err)
+					continue
+				}
+				// Extract host from "Name [host]"
+				start := strings.LastIndex(mirrorSelection, "[")
+				end := strings.LastIndex(mirrorSelection, "]")
+				if start != -1 && end != -1 {
+					selectedMirrorHost = mirrorSelection[start+1 : end]
+				}
+			}
+			fmt.Printf("  Using mirror site: %s\n", selectedMirrorHost)
 
 			if !dryRun {
 				for _, f := range files {
@@ -88,24 +140,18 @@ var switchCmd = &cobra.Command{
 					}
 				}
 
-				switched, err := switcher.Switch(rt, switcher.Config{RepoDir: repoDir})
+				switched, err := switcher.Switch(rt, switcher.Config{
+					RepoDir:         repoDir,
+					MirrorHost:      selectedMirrorHost,
+					DisableOpenH264: disableOpenH264ForRepo,
+				})
 				if err != nil {
 					fmt.Printf("  Error switching %s: %v\n", rt, err)
 				} else {
 					fmt.Printf("  Successfully switched %d files for %s.\n", len(switched), rt)
 				}
 			} else {
-				fmt.Printf("  (Dry run) Would switch %d files for %s.\n", len(files), rt)
-			}
-		}
-
-		if !noCache && !dryRun {
-			fmt.Println("Running dnf makecache...")
-			execCmd := exec.Command("dnf", "makecache")
-			execCmd.Stdout = os.Stdout
-			execCmd.Stderr = os.Stderr
-			if err := execCmd.Run(); err != nil {
-				fmt.Printf("Error running dnf makecache: %v\n", err)
+				fmt.Printf("  (Dry run) Would switch %d files for %s using %s.\n", len(files), rt, selectedMirrorHost)
 			}
 		}
 	},
@@ -122,16 +168,6 @@ var restoreCmd = &cobra.Command{
 			return
 		}
 		fmt.Printf("Successfully restored %d repository files.\n", len(restored))
-
-		if !noCache {
-			fmt.Println("Running dnf makecache...")
-			execCmd := exec.Command("dnf", "makecache")
-			execCmd.Stdout = os.Stdout
-			execCmd.Stderr = os.Stderr
-			if err := execCmd.Run(); err != nil {
-				fmt.Printf("Error running dnf makecache: %v\n", err)
-			}
-		}
 	},
 }
 
@@ -145,9 +181,9 @@ func Execute() {
 func init() {
 	rootCmd.PersistentFlags().StringVarP(&repoDir, "repo-dir", "d", "/etc/yum.repos.d/", "Directory containing repository files")
 	rootCmd.PersistentFlags().StringVar(&osReleasePath, "os-release", "/etc/os-release", "Path to os-release file")
-	rootCmd.PersistentFlags().BoolVar(&noCache, "no-cache", false, "Do not run dnf makecache after operation")
 	rootCmd.PersistentFlags().BoolVar(&dryRun, "dry-run", false, "Show what would be done without making changes")
 	rootCmd.PersistentFlags().BoolVarP(&interactive, "interactive", "i", false, "Interactive mode")
+	switchCmd.Flags().BoolVar(&disableOpenH264, "disable-openh264", false, "Disable fedora-cisco-openh264 repositories instead of switching them")
 
 	rootCmd.AddCommand(switchCmd)
 	rootCmd.AddCommand(restoreCmd)
